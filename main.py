@@ -612,81 +612,166 @@ async def generate_excel(data: dict):
             vc.font = Font(size=10)
         current_row += 1
 
+    trade_date = header_info.get('trade_date', str(datetime.date.today()))
+    broker_name = broker_info.get('broker', 'Broker')
+
+    # ── Build Dr / Cr ledger lists (used for both Excel Sheet 2 & Tally XML) ──
+    # Convention: dr_entries / cr_entries = list of (ledger_name, amount, narration)
+
+    dr_entries = []
+    cr_entries = []
+
+    # Equity buys → Dr. Stock A/c
+    for trade in equity_trades:
+        buy_val = trade.get('total_buy_value', 0)
+        if buy_val > 0:
+            sec = trade.get('security', 'Investment')
+            narr = (f"Purchase: {sec} × {int(trade.get('buy_qty',0))} "
+                    f"shares @ ₹{trade.get('buy_wap',0):.2f}")
+            dr_entries.append((f"{sec} A/c", buy_val, narr))
+
+    # Equity sells → Cr. Stock A/c
+    for trade in equity_trades:
+        sell_val = trade.get('total_sell_value', 0)
+        if sell_val > 0:
+            sec = trade.get('security', 'Investment')
+            narr = (f"Sale: {sec} × {int(trade.get('sell_qty',0))} "
+                    f"shares @ ₹{trade.get('sell_wap',0):.2f}")
+            cr_entries.append((f"{sec} A/c", sell_val, narr))
+
+    # F&O: loss → Dr. F&O P&L A/c | profit → Cr. F&O P&L A/c
+    for deriv in derivatives:
+        net = deriv.get('net_total', 0)
+        if net == 0:
+            continue
+        contract_short = deriv.get('contract', 'F&O Contract')[:40]
+        narr = f"{deriv.get('buy_sell','')} {contract_short}"
+        if net < 0:
+            dr_entries.append(('F&O Trading P&L A/c', abs(net), narr))
+        else:
+            cr_entries.append(('F&O Trading P&L A/c', net, narr))
+
+    # Expenses → Dr.
+    expense_entries = [
+        ('STT Expense A/c',          stt,   'Securities Transaction Tax (STT)'),
+        ('GST Expense A/c',          gst,   'GST on Brokerage  (CGST @ 9% + SGST @ 9%)'),
+        ('Exchange Charges Exp A/c', exc,   'Exchange Transaction Charges'),
+        ('SEBI Charges Exp A/c',     sebi,  'SEBI Turnover Fees'),
+        ('Stamp Duty Expense A/c',   stamp, 'Stamp Duty'),
+        ('IPF Charges Exp A/c',      ipf,   'IPF / Investor Protection Fund'),
+    ]
+    for ledger, amt, narr in expense_entries:
+        if amt and amt > 0:
+            dr_entries.append((ledger, amt, narr))
+
+    # Net balancing entry: broker payable / receivable
+    total_dr_val = sum(a for _, a, _ in dr_entries)
+    total_cr_val = sum(a for _, a, _ in cr_entries)
+    net_diff = round(total_dr_val - total_cr_val, 2)   # positive → payable, negative → receivable
+
+    if net_diff > 0:
+        cr_entries.append((f'{broker_name} Payable A/c', net_diff,
+                           f'Net amount payable to {broker_name}'))
+    elif net_diff < 0:
+        dr_entries.append((f'{broker_name} Receivable A/c', abs(net_diff),
+                           f'Net amount receivable from {broker_name}'))
+
     # ── Sheet 2: Tally Journal Entry ─────────────────────────────────────────
     ws2 = wb.create_sheet("Tally Journal Entry")
     ws2.sheet_view.showGridLines = False
-    title_merge(ws2, 'A1:F1', '📒  TALLY JOURNAL ENTRY FORMAT  |  BrokerNote AI')
+    title_merge(ws2, 'A1:F1', '📒  TALLY JOURNAL ENTRY  |  Ready to import in TallyPrime  |  BrokerNote AI')
     ws2.row_dimensions[1].height = 32
 
     jcols = [
-        ('A', 'Date', 14), ('B', 'Voucher Type', 16),
-        ('C', 'Narration / Particulars', 38),
-        ('D', 'Ledger Name', 32), ('E', 'Debit (₹)', 16), ('F', 'Credit (₹)', 16),
+        ('A', 'Date', 14), ('B', 'Dr / Cr', 8),
+        ('C', 'Ledger Name (create in Tally if missing)', 40),
+        ('D', 'Narration / Particulars', 46),
+        ('E', 'Debit (₹)', 16), ('F', 'Credit (₹)', 16),
     ]
     for col_letter, col_name, width in jcols:
         hdr_cell(ws2[f'{col_letter}3'], col_name)
         ws2.column_dimensions[col_letter].width = width
 
-    trade_date = header_info.get('trade_date', str(datetime.date.today()))
     journal_rows = []
+    # Dr entries
+    for ledger, amt, narr in dr_entries:
+        journal_rows.append([trade_date, 'Dr', ledger, narr, amt, ''])
+    # Cr entries
+    for ledger, amt, narr in cr_entries:
+        journal_rows.append([trade_date, 'Cr', ledger, narr, '', amt])
 
-    # Equity journal entries
-    for trade in equity_trades:
-        sec = trade.get('security', 'Investment')
-        sell_val = trade.get('total_sell_value', 0)
-        buy_val  = trade.get('total_buy_value', 0)
-        if sell_val > 0:
-            journal_rows.append([trade_date, 'Journal',
-                f"Sale: {sec} × {int(trade.get('sell_qty',0))} shares @ ₹{trade.get('sell_wap',0):.2f}",
-                'Broker Receivable A/c', sell_val, ''])
-            journal_rows.append([trade_date, 'Journal', '', f"{sec} A/c (Investment)", '', sell_val])
-        if buy_val > 0:
-            journal_rows.append([trade_date, 'Journal',
-                f"Purchase: {sec} × {int(trade.get('buy_qty',0))} shares @ ₹{trade.get('buy_wap',0):.2f}",
-                f"{sec} A/c (Investment)", buy_val, ''])
-            journal_rows.append([trade_date, 'Journal', '', 'Broker Payable A/c', '', buy_val])
-
-    # Derivative journal entries
-    for deriv in derivatives:
-        net = deriv.get('net_total', 0)
-        bs  = deriv.get('buy_sell', '')
-        contract = deriv.get('contract', 'F&O Contract')
-        if net != 0:
-            if net > 0:
-                journal_rows.append([trade_date, 'Journal',
-                    f"{bs}: {contract} — P&L",
-                    'Broker Receivable A/c', abs(net), ''])
-                journal_rows.append([trade_date, 'Journal', '',
-                    'F&O Trading P&L A/c', '', abs(net)])
-            else:
-                journal_rows.append([trade_date, 'Journal',
-                    f"{bs}: {contract} — P&L",
-                    'F&O Trading P&L A/c', abs(net), ''])
-                journal_rows.append([trade_date, 'Journal', '',
-                    'Broker Payable A/c', '', abs(net)])
-
-    # Charges entries
-    if stt > 0:
-        journal_rows.append([trade_date, 'Journal', 'Securities Transaction Tax', 'STT Expense A/c', stt, ''])
-    if gst > 0:
-        journal_rows.append([trade_date, 'Journal', f'GST on Brokerage (CGST+SGST)', 'GST Expense A/c', gst, ''])
-    if exc > 0:
-        journal_rows.append([trade_date, 'Journal', 'Exchange Transaction Charges', 'Exchange Charges Exp A/c', exc, ''])
-    if sebi > 0:
-        journal_rows.append([trade_date, 'Journal', 'SEBI Turnover Fees', 'SEBI Charges Exp A/c', sebi, ''])
-    if stamp > 0:
-        journal_rows.append([trade_date, 'Journal', 'Stamp Duty', 'Stamp Duty Expense A/c', stamp, ''])
-
+    j_start = 4
     for i, jr in enumerate(journal_rows):
-        r = 4 + i
+        r = j_start + i
         fill = PatternFill("solid", fgColor=ALT_ROW) if i % 2 == 0 else None
         for col, val in enumerate(jr, 1):
             c = ws2.cell(row=r, column=col, value=val)
             c.border = make_border()
             c.font   = Font(size=10)
             if fill: c.fill = fill
+            if col == 2:   # Dr/Cr label
+                c.font = Font(bold=True, color='1D4ED8' if val == 'Dr' else 'DC2626', size=10)
             if col in (5, 6) and isinstance(val, (int, float)) and val:
                 c.number_format = '#,##0.00'
+
+    # Totals row
+    total_row = j_start + len(journal_rows)
+    for col in range(1, 7):
+        c = ws2.cell(row=total_row, column=col)
+        c.fill   = PatternFill("solid", fgColor=DARK_BLUE)
+        c.border = make_border()
+        c.font   = Font(bold=True, color=WHITE, size=10)
+    ws2.cell(row=total_row, column=1, value='TOTAL').font = Font(bold=True, color=WHITE)
+    tot_dr = sum(a for _, a, _ in dr_entries)
+    tot_cr = sum(a for _, a, _ in cr_entries)
+    drc = ws2.cell(row=total_row, column=5, value=round(tot_dr, 2))
+    drc.number_format = '#,##0.00'
+    drc.font = Font(bold=True, color=WHITE)
+    crc = ws2.cell(row=total_row, column=6, value=round(tot_cr, 2))
+    crc.number_format = '#,##0.00'
+    crc.font = Font(bold=True, color=WHITE)
+
+    # Balance check note
+    bal_row = total_row + 1
+    bal_ok = abs(tot_dr - tot_cr) < 0.05
+    note = ws2.cell(row=bal_row, column=5,
+                    value='✅ Balanced' if bal_ok else f'⚠ Diff: {round(tot_dr - tot_cr, 2)}')
+    note.font = Font(bold=True, color='16A34A' if bal_ok else 'DC2626', size=10)
+    ws2.merge_cells(start_row=bal_row, start_column=5, end_row=bal_row, end_column=6)
+
+    # Ledger setup guide
+    guide_row = bal_row + 3
+    guide_hdr = ws2.cell(row=guide_row, column=1,
+                         value='📋  TALLY LEDGER SETUP GUIDE — Create these ledgers before importing XML')
+    guide_hdr.font = Font(bold=True, size=11, color=DARK_BLUE)
+    guide_hdr.fill = PatternFill("solid", fgColor="E8F0FE")
+    ws2.merge_cells(start_row=guide_row, start_column=1, end_row=guide_row, end_column=6)
+
+    ledger_guide = [
+        ('Ledger Name',                  'Group in Tally',         'Notes'),
+        ('Each Stock A/c (e.g. Infosys A/c)', 'Investments',       'One ledger per security'),
+        ('F&O Trading P&L A/c',          'Indirect Income/Loss',   'For F&O net profit/loss'),
+        (f'{broker_name} Payable A/c',   'Sundry Creditors',       'Broker net payable'),
+        (f'{broker_name} Receivable A/c','Sundry Debtors',         'Broker net receivable'),
+        ('STT Expense A/c',              'Indirect Expenses',      'Securities Transaction Tax'),
+        ('GST Expense A/c',              'Duties & Taxes',         'CGST + SGST on brokerage'),
+        ('Exchange Charges Exp A/c',     'Indirect Expenses',      'NSE / BSE exchange fees'),
+        ('SEBI Charges Exp A/c',         'Indirect Expenses',      'SEBI turnover fees'),
+        ('Stamp Duty Expense A/c',       'Indirect Expenses',      'State stamp duty'),
+    ]
+    for gi, (ln, grp, note_txt) in enumerate(ledger_guide):
+        gr = guide_row + 1 + gi
+        cells = [
+            ws2.cell(row=gr, column=1, value=ln),
+            ws2.cell(row=gr, column=2, value=grp),
+            ws2.cell(row=gr, column=3, value=note_txt),
+        ]
+        for gc in cells:
+            gc.border = make_border()
+            gc.font   = Font(bold=(gi == 0), size=10,
+                             color=DARK_BLUE if gi == 0 else '000000')
+            if gi == 0:
+                gc.fill = PatternFill("solid", fgColor="DBEAFE")
 
     # ── Sheet 3: Order Details ────────────────────────────────────────────────
     if order_details:
@@ -714,6 +799,112 @@ async def generate_excel(data: dict):
                 c.font   = Font(size=10)
                 if fill: c.fill = fill
 
+    # ── Sheet 4: P&L Summary ──────────────────────────────────────────────────
+    ws4 = wb.create_sheet("P&L Summary")
+    ws4.sheet_view.showGridLines = False
+    title_merge(ws4, 'A1:D1', '📈  PROFIT & LOSS SUMMARY  |  BrokerNote AI')
+    ws4.row_dimensions[1].height = 32
+    ws4.column_dimensions['A'].width = 38
+    ws4.column_dimensions['B'].width = 20
+    ws4.column_dimensions['C'].width = 20
+    ws4.column_dimensions['D'].width = 20
+
+    # Section header helper
+    def pnl_section(ws, row, title):
+        c = ws.cell(row=row, column=1, value=title)
+        c.font = Font(bold=True, size=11, color=WHITE)
+        c.fill = PatternFill("solid", fgColor=DARK_BLUE)
+        for col in range(2, 5):
+            ws.cell(row=row, column=col).fill = PatternFill("solid", fgColor=DARK_BLUE)
+            ws.cell(row=row, column=col).border = make_border()
+        c.border = make_border()
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
+        return row + 1
+
+    def pnl_row(ws, row, label, value, is_total=False, positive_green=True):
+        lc = ws.cell(row=row, column=1, value=label)
+        vc = ws.cell(row=row, column=4, value=round(value, 2) if value is not None else None)
+        lc.border = vc.border = make_border()
+        vc.number_format = '₹#,##0.00'
+        if is_total:
+            color = ("16A34A" if value >= 0 else "DC2626") if positive_green else DARK_BLUE
+            lc.font = Font(bold=True, size=11, color=DARK_BLUE)
+            vc.font = Font(bold=True, size=12, color=color)
+            lc.fill = vc.fill = PatternFill("solid", fgColor="DBEAFE")
+        else:
+            lc.font = Font(size=10)
+            vc.font = Font(size=10)
+        return row + 1
+
+    pr = 3  # start row
+
+    # ── Equity Section
+    total_buy_val  = sum(t.get('total_buy_value', 0)  for t in equity_trades)
+    total_sell_val = sum(t.get('total_sell_value', 0) for t in equity_trades)
+    equity_pnl     = total_sell_val - total_buy_val
+
+    if equity_trades:
+        pr = pnl_section(ws4, pr, '📈  EQUITY SEGMENT')
+        pr = pnl_row(ws4, pr, 'Total Buy Value (all securities)', total_buy_val)
+        pr = pnl_row(ws4, pr, 'Total Sell Value (all securities)', total_sell_val)
+        pr = pnl_row(ws4, pr, 'Equity Gross P&L  (Sell − Buy)', equity_pnl, is_total=True)
+        pr += 1
+
+    # ── F&O Section
+    fo_pnl = sum(d.get('net_total', 0) for d in derivatives)
+    if derivatives:
+        pr = pnl_section(ws4, pr, '📊  DERIVATIVE / F&O SEGMENT')
+        for deriv in derivatives:
+            label = f"  {deriv.get('buy_sell','')}  {deriv.get('contract','')[:35]}"
+            pnl_val = deriv.get('net_total', 0)
+            lc = ws4.cell(row=pr, column=1, value=label)
+            vc = ws4.cell(row=pr, column=4, value=round(pnl_val, 2))
+            lc.border = vc.border = make_border()
+            lc.font = Font(size=10)
+            vc.font = Font(size=10, color='16A34A' if pnl_val >= 0 else 'DC2626')
+            vc.number_format = '₹#,##0.00'
+            pr += 1
+        pr = pnl_row(ws4, pr, 'Net F&O P&L', fo_pnl, is_total=True)
+        pr += 1
+
+    # ── Expenses Section
+    total_expenses = stt + gst + exc + sebi + stamp + ipf
+    pr = pnl_section(ws4, pr, '💰  TOTAL EXPENSES (All Segments Combined)')
+    exp_detail = [
+        ('Securities Transaction Tax (STT)', stt),
+        ('GST Expense (CGST @ 9% + SGST @ 9%)', gst),
+        ('Exchange Transaction Charges', exc),
+        ('SEBI Turnover Fees', sebi),
+        ('Stamp Duty', stamp),
+        ('IPF Charges', ipf),
+    ]
+    for label, val in exp_detail:
+        if val and val > 0:
+            pr = pnl_row(ws4, pr, f'  {label}', val)
+    pr = pnl_row(ws4, pr, 'Total Expenses', total_expenses, is_total=True, positive_green=False)
+    pr += 1
+
+    # ── Net P&L
+    pr = pnl_section(ws4, pr, '🏁  NET SETTLEMENT')
+    net_pnl_overall = equity_pnl + fo_pnl - total_expenses
+    pr = pnl_row(ws4, pr, 'Equity Gross P&L', equity_pnl)
+    if derivatives:
+        pr = pnl_row(ws4, pr, 'F&O Net P&L', fo_pnl)
+    pr = pnl_row(ws4, pr, 'Less: Total Expenses', -total_expenses)
+    pr = pnl_row(ws4, pr, '★  NET P&L (after expenses)', net_pnl_overall, is_total=True)
+    pr += 1
+    pr = pnl_row(ws4, pr, 'Net Amount Payable / (Receivable) from Broker',
+                 net, is_total=True, positive_green=False)
+
+    # ITR filing note
+    pr += 2
+    note_c = ws4.cell(row=pr, column=1,
+        value='ℹ  ITR Filing Note:  Equity gains → Schedule CG (STCG/LTCG)  |  '
+              'F&O income → Schedule BP (Business Profession)  |  Expenses → Deductible')
+    note_c.font = Font(italic=True, size=9, color='374151')
+    note_c.fill = PatternFill("solid", fgColor="FEF9C3")
+    ws4.merge_cells(start_row=pr, start_column=1, end_row=pr, end_column=4)
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -726,7 +917,7 @@ async def generate_excel(data: dict):
     )
 
 
-# ─── Tally XML ────────────────────────────────────────────────────────────────
+# ─── Tally XML — Balanced Journal Voucher ────────────────────────────────────
 
 @app.post("/tally-xml")
 async def generate_tally_xml(data: dict):
@@ -734,6 +925,7 @@ async def generate_tally_xml(data: dict):
     equity      = data.get('trades', [])
     derivatives = data.get('derivatives', [])
     charges     = data.get('charges', {})
+    broker      = data.get('broker_info', {}).get('broker', 'Broker')
 
     trade_date = header.get('trade_date', '')
     try:
@@ -743,70 +935,105 @@ async def generate_tally_xml(data: dict):
         tally_date = datetime.datetime.now().strftime('%Y%m%d')
 
     narration = (
-        f"Contract Note: {header.get('contract_note_no','')} | "
-        f"Client: {header.get('client_name','')} | PAN: {header.get('pan','')} | "
-        f"Broker: {data.get('broker_info',{}).get('broker','')}"
+        f"Contract Note: {header.get('contract_note_no', '')} | "
+        f"Client: {header.get('client_name', '')} | PAN: {header.get('pan', '')} | "
+        f"Broker: {broker} | Settlement: {header.get('settlement_no', '')}"
     )
+
+    gst_val   = charges.get('gst',  round(charges.get('cgst', 0) + charges.get('sgst', 0), 2))
+    stt_val   = charges.get('stt', 0)
+    exc_val   = charges.get('exchange_charges', 0)
+    sebi_val  = charges.get('sebi_fees', 0)
+    stamp_val = charges.get('stamp_duty', 0)
+    ipf_val   = charges.get('ipf_charges', 0)
+
+    # Build balanced Dr / Cr entry lists
+    # dr_list / cr_list = list of (ledger_name, amount)
+    dr_list = []
+    cr_list = []
+
+    # Equity buys → Dr. Stock A/c
+    for trade in equity:
+        buy_val = trade.get('total_buy_value', 0)
+        if buy_val > 0:
+            dr_list.append((f"{trade.get('security', 'Investment')} A/c", buy_val))
+
+    # Equity sells → Cr. Stock A/c
+    for trade in equity:
+        sell_val = trade.get('total_sell_value', 0)
+        if sell_val > 0:
+            cr_list.append((f"{trade.get('security', 'Investment')} A/c", sell_val))
+
+    # F&O: loss → Dr., profit → Cr.
+    for deriv in derivatives:
+        net = deriv.get('net_total', 0)
+        if net < 0:
+            dr_list.append(('F&O Trading P&L A/c', abs(net)))
+        elif net > 0:
+            cr_list.append(('F&O Trading P&L A/c', net))
+
+    # Expenses → Dr.
+    for ledger, amt in [
+        ('STT Expense A/c',          stt_val),
+        ('GST Expense A/c',          gst_val),
+        ('Exchange Charges Exp A/c', exc_val),
+        ('SEBI Charges Exp A/c',     sebi_val),
+        ('Stamp Duty Expense A/c',   stamp_val),
+        ('IPF Charges Exp A/c',      ipf_val),
+    ]:
+        if amt and amt > 0:
+            dr_list.append((ledger, amt))
+
+    # Balancing entry: net broker payable / receivable
+    total_dr = sum(a for _, a in dr_list)
+    total_cr = sum(a for _, a in cr_list)
+    diff = round(total_dr - total_cr, 2)
+    if diff > 0:
+        cr_list.append((f'{broker} Payable A/c', diff))
+    elif diff < 0:
+        dr_list.append((f'{broker} Receivable A/c', abs(diff)))
+
+    # Build XML
+    def xml_entry(ledger: str, is_dr: bool, amount: float) -> list:
+        """ISDEEMEDPOSITIVE=Yes → Dr (amount negative); No → Cr (amount positive)."""
+        sign = '-' if is_dr else ''
+        return [
+            '        <ALLLEDGERENTRIES.LIST>',
+            f'          <LEDGERNAME>{ledger}</LEDGERNAME>',
+            f'          <ISDEEMEDPOSITIVE>{"Yes" if is_dr else "No"}</ISDEEMEDPOSITIVE>',
+            f'          <AMOUNT>{sign}{abs(amount):.2f}</AMOUNT>',
+            '        </ALLLEDGERENTRIES.LIST>',
+        ]
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<ENVELOPE>',
         '  <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>',
-        '  <BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>',
-        '    <STATICVARIABLES><SVCURRENTCOMPANY>##SVCURRENTCOMPANY##</SVCURRENTCOMPANY></STATICVARIABLES>',
-        '  </REQUESTDESC><REQUESTDATA>',
-        '    <TALLYMESSAGE xmlns:UDF="TallyUDF">',
-        '      <VOUCHER VCHTYPE="Journal" ACTION="Create" OBJVIEW="Accounting Voucher View">',
-        f'        <DATE>{tally_date}</DATE>',
-        f'        <NARRATION>{narration}</NARRATION>',
-        '        <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>',
+        '  <BODY><IMPORTDATA>',
+        '    <REQUESTDESC>',
+        '      <REPORTNAME>Vouchers</REPORTNAME>',
+        '      <STATICVARIABLES>',
+        '        <SVCURRENTCOMPANY>##SVCURRENTCOMPANY##</SVCURRENTCOMPANY>',
+        '      </STATICVARIABLES>',
+        '    </REQUESTDESC>',
+        '    <REQUESTDATA>',
+        '      <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+        '        <VOUCHER VCHTYPE="Journal" ACTION="Create" OBJVIEW="Accounting Voucher View">',
+        f'          <DATE>{tally_date}</DATE>',
+        f'          <NARRATION>{narration}</NARRATION>',
+        '          <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>',
     ]
 
-    total_dr = 0.0
+    for ledger, amt in dr_list:
+        lines += xml_entry(ledger, is_dr=True,  amount=amt)
+    for ledger, amt in cr_list:
+        lines += xml_entry(ledger, is_dr=False, amount=amt)
 
-    for trade in equity:
-        buy_val = trade.get('total_buy_value', 0)
-        if buy_val > 0:
-            total_dr += buy_val
-            lines += [
-                '        <ALLLEDGERENTRIES.LIST>',
-                f'          <LEDGERNAME>{trade.get("security","Investment")} A/c</LEDGERNAME>',
-                '          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
-                f'          <AMOUNT>-{buy_val:.2f}</AMOUNT>',
-                '        </ALLLEDGERENTRIES.LIST>',
-            ]
-
-    # GST combined
-    gst = charges.get('gst', round(charges.get('cgst', 0) + charges.get('sgst', 0), 2))
-    charge_map = [
-        ("STT Expense A/c",          'stt'),
-        ("GST Expense A/c",          'gst'),
-        ("Exchange Charges Exp A/c", 'exchange_charges'),
-        ("SEBI Charges Exp A/c",     'sebi_fees'),
-        ("Stamp Duty Expense A/c",   'stamp_duty'),
-    ]
-    for ledger, key in charge_map:
-        amt = abs(charges.get(key, 0))
-        if amt > 0:
-            total_dr += amt
-            lines += [
-                '        <ALLLEDGERENTRIES.LIST>',
-                f'          <LEDGERNAME>{ledger}</LEDGERNAME>',
-                '          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
-                f'          <AMOUNT>-{amt:.2f}</AMOUNT>',
-                '        </ALLLEDGERENTRIES.LIST>',
-            ]
-
-    broker = data.get('broker_info', {}).get('broker', 'Broker')
     lines += [
-        '        <ALLLEDGERENTRIES.LIST>',
-        f'          <LEDGERNAME>{broker} Payable A/c</LEDGERNAME>',
-        '          <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>',
-        f'          <AMOUNT>{total_dr:.2f}</AMOUNT>',
-        '        </ALLLEDGERENTRIES.LIST>',
-        '      </VOUCHER>',
-        '    </TALLYMESSAGE>',
-        '  </REQUESTDATA></IMPORTDATA></BODY>',
+        '        </VOUCHER>',
+        '      </TALLYMESSAGE>',
+        '    </REQUESTDATA>',
+        '  </IMPORTDATA></BODY>',
         '</ENVELOPE>',
     ]
 
