@@ -11,7 +11,7 @@ import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-app = FastAPI(title="BrokerNote AI", version="1.0.0")
+app = FastAPI(title="BrokerNote AI", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,11 +63,11 @@ def verify_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-# ─── Auth endpoints ───────────────────────────────────────────────────────────
+# ─── Auth ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "BrokerNote AI", "version": "1.0.0"}
+    return {"status": "ok", "service": "BrokerNote AI", "version": "2.0.0"}
 
 
 @app.post("/auth/signup")
@@ -116,7 +116,7 @@ async def login(request_data: dict):
     return {"token": token, "email": user[0], "name": user[1], "firm": user[2]}
 
 
-# ─── PDF Extraction ───────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def safe_float(val) -> float:
     if val is None:
@@ -164,7 +164,10 @@ def extract_broker_info(text: str) -> dict:
     return info
 
 
-def extract_trades_from_table(table: list) -> list:
+# ─── Equity Trades ───────────────────────────────────────────────────────────
+
+def extract_equity_from_table(table: list) -> list:
+    """Extract equity (ISIN-based) trades from a table."""
     trades = []
     is_trade_table = False
     for row in table:
@@ -176,55 +179,112 @@ def extract_trades_from_table(table: list) -> list:
             continue
         if is_trade_table and row[0] and str(row[0]).startswith('INE'):
             try:
-                trade = {
+                trades.append({
                     "isin":                    (row[0] or '').strip(),
                     "security":                (row[1] or '').strip().replace('\n', ' '),
                     "buy_qty":                 safe_float(row[2] if len(row) > 2 else 0),
                     "buy_wap":                 safe_float(row[3] if len(row) > 3 else 0),
-                    "buy_brokerage_per_share": safe_float(row[4] if len(row) > 4 else 0),
-                    "buy_wap_after_brokerage": safe_float(row[5] if len(row) > 5 else 0),
                     "total_buy_value":         safe_float(row[6] if len(row) > 6 else 0),
                     "sell_qty":                safe_float(row[7] if len(row) > 7 else 0),
                     "sell_wap":                safe_float(row[8] if len(row) > 8 else 0),
-                    "sell_brokerage_per_share":safe_float(row[9] if len(row) > 9 else 0),
-                    "sell_wap_after_brokerage":safe_float(row[10] if len(row) > 10 else 0),
                     "total_sell_value":        safe_float(row[11] if len(row) > 11 else 0),
                     "net_qty":                 safe_float(row[12] if len(row) > 12 else 0),
                     "net_obligation":          safe_float(row[13] if len(row) > 13 else 0),
-                }
-                if trade["isin"]:
-                    trades.append(trade)
+                })
             except Exception:
                 pass
     return trades
 
 
-def extract_charges_from_table(table: list) -> dict:
+# ─── Derivative Trades ────────────────────────────────────────────────────────
+
+def extract_derivatives_from_table(table: list) -> list:
+    """Extract F&O / derivative trades from a table."""
+    derivatives = []
+    is_deriv_table = False
+
+    DERIV_KEYWORDS = ['FUTSTK', 'FUTIDX', 'OPTIDX', 'OPTSTK', 'FUTCOM', 'FUTSTK']
+
     for row in table:
         if not row:
             continue
         row_str = ' '.join([str(c) for c in row if c])
-        # Look for the TOTAL row which has actual charge numbers
+
+        # Detect derivative header
+        if 'Contract Description' in row_str and ('Buy' in row_str or 'Sell' in row_str):
+            is_deriv_table = True
+            continue
+
+        if is_deriv_table and row[0]:
+            first_cell = str(row[0]).strip()
+            # Skip total row
+            if 'Total' in first_cell or 'TOTAL' in first_cell:
+                continue
+            # Check if it's a derivative row (contract name contains known types)
+            has_deriv_keyword = any(kw in first_cell.upper() for kw in DERIV_KEYWORDS)
+            has_may_jun = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2}\s+\d{4}', first_cell)
+            if has_deriv_keyword or has_may_jun:
+                try:
+                    # Determine instrument type
+                    if 'FUTSTK' in first_cell.upper() or 'FUTIDX' in first_cell.upper():
+                        instrument = 'Futures'
+                    elif 'OPTIDX' in first_cell.upper() or 'OPTSTK' in first_cell.upper():
+                        instrument = 'Options'
+                    else:
+                        instrument = 'Derivatives'
+
+                    derivatives.append({
+                        "contract":      first_cell.replace('\n', ' '),
+                        "instrument":    instrument,
+                        "buy_sell":      str(row[1] or '').strip().replace('\n', ' '),
+                        "qty":           safe_float(row[2] if len(row) > 2 else 0),
+                        "wap":           safe_float(row[3] if len(row) > 3 else 0),
+                        "wap_after_brokerage": safe_float(row[5] if len(row) > 5 else 0),
+                        "closing_rate":  safe_float(row[6] if len(row) > 6 else 0),
+                        "net_total":     safe_float(row[7] if len(row) > 7 else 0),
+                    })
+                except Exception:
+                    pass
+
+    return derivatives
+
+
+# ─── Charges ─────────────────────────────────────────────────────────────────
+
+def extract_charges_from_table(table: list) -> dict:
+    """Extract consolidated charges from TOTAL(NET) row.
+    Returns category-wise totals with GST = CGST + SGST combined."""
+    for row in table:
+        if not row:
+            continue
+        row_str = ' '.join([str(c) for c in row if c])
         if 'TOTAL' in row_str and len([c for c in row if c]) >= 8:
             try:
-                nums = [safe_float(c) for c in row if c and c != 'TOTAL(NET)' and c != 'NSE-CAPITAL']
+                nums = [safe_float(c) for c in row
+                        if c and str(c).strip() not in ('TOTAL(NET)', 'TOTAL', 'NSE-CAPITAL',
+                                                         'NSE-FUTURES', 'BSE-CAPITAL')]
                 if len(nums) >= 8:
+                    cgst = nums[3] if len(nums) > 3 else 0
+                    sgst = nums[4] if len(nums) > 4 else 0
                     return {
-                        "pay_obligation":    nums[0] if len(nums) > 0 else 0,
-                        "stt":               nums[1] if len(nums) > 1 else 0,
-                        "taxable_value":     nums[2] if len(nums) > 2 else 0,
-                        "cgst":              nums[3] if len(nums) > 3 else 0,
-                        "sgst":              nums[4] if len(nums) > 4 else 0,
-                        "exchange_charges":  nums[5] if len(nums) > 5 else 0,
-                        "sebi_fees":         nums[6] if len(nums) > 6 else 0,
-                        "stamp_duty":        nums[7] if len(nums) > 7 else 0,
-                        "ipf_charges":       nums[8] if len(nums) > 8 else 0,
-                        "net_amount":        nums[-1] if nums else 0,
+                        "pay_obligation":   nums[0],
+                        "stt":              nums[1],
+                        "taxable_value":    nums[2],   # brokerage taxable value
+                        "cgst":             cgst,
+                        "sgst":             sgst,
+                        "gst":              round(cgst + sgst, 4),   # combined GST
+                        "exchange_charges": nums[5] if len(nums) > 5 else 0,
+                        "sebi_fees":        nums[6] if len(nums) > 6 else 0,
+                        "stamp_duty":       nums[7] if len(nums) > 7 else 0,
+                        "ipf_charges":      nums[8] if len(nums) > 8 else 0,
+                        "net_amount":       nums[-1],
                     }
             except Exception:
                 pass
     return {}
 
+
+# ─── Order Details ────────────────────────────────────────────────────────────
 
 def extract_orders_from_table(table: list) -> list:
     orders = []
@@ -253,35 +313,47 @@ def extract_orders_from_table(table: list) -> list:
     return orders
 
 
+# ─── Main Extraction ──────────────────────────────────────────────────────────
+
 def extract_contract_note(pdf_bytes: bytes) -> dict:
     result = {
-        "header": {},
-        "broker_info": {},
-        "trades": [],
-        "charges": {},
+        "header":        {},
+        "broker_info":   {},
+        "trades":        [],    # equity trades (ISIN-based)
+        "derivatives":   [],    # F&O / derivative trades
+        "charges":       {},
         "order_details": [],
     }
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
+            text  = page.extract_text() or ""
             tables = page.extract_tables()
 
             if page_num == 0:
-                result["header"] = extract_header(text)
+                result["header"]      = extract_header(text)
                 result["broker_info"] = extract_broker_info(text)
+
                 for table in tables:
-                    trades = extract_trades_from_table(table)
-                    if trades:
-                        result["trades"].extend(trades)
-                    charges = extract_charges_from_table(table)
-                    if charges:
-                        result["charges"] = charges
+                    # Equity trades
+                    eq = extract_equity_from_table(table)
+                    if eq:
+                        result["trades"].extend(eq)
+
+                    # Derivative trades
+                    dv = extract_derivatives_from_table(table)
+                    if dv:
+                        result["derivatives"].extend(dv)
+
+                    # Charges
+                    ch = extract_charges_from_table(table)
+                    if ch:
+                        result["charges"] = ch
 
             elif page_num == 1:
                 for table in tables:
-                    orders = extract_orders_from_table(table)
-                    if orders:
-                        result["order_details"].extend(orders)
+                    od = extract_orders_from_table(table)
+                    if od:
+                        result["order_details"].extend(od)
 
     return result
 
@@ -299,198 +371,311 @@ async def extract_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
 
-# ─── Excel Generation ─────────────────────────────────────────────────────────
+# ─── Excel Styles ─────────────────────────────────────────────────────────────
+
+DARK_BLUE  = "1B2A4A"
+MID_BLUE   = "2563EB"
+PURPLE     = "7C3AED"
+LIGHT_BLUE = "EBF3FF"
+ALT_ROW    = "F5F8FF"
+WHITE      = "FFFFFF"
+GREEN_DARK = "14532D"
+GREEN_MID  = "16A34A"
 
 def make_border():
     side = Side(style='thin', color='D0D7E5')
     return Border(left=side, right=side, top=side, bottom=side)
 
-DARK_BLUE   = "1B2A4A"
-MID_BLUE    = "2563EB"
-LIGHT_BLUE  = "EBF3FF"
-ALT_ROW     = "F5F8FF"
-WHITE       = "FFFFFF"
-GREEN       = "16A34A"
+def hdr_cell(cell, text, color=MID_BLUE):
+    cell.value = text
+    cell.font  = Font(bold=True, color=WHITE, size=10)
+    cell.fill  = PatternFill("solid", fgColor=color)
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    cell.border = make_border()
 
+def title_merge(ws, cell_range, text, color=LIGHT_BLUE, text_color=DARK_BLUE):
+    ws.merge_cells(cell_range)
+    c = ws[cell_range.split(':')[0]]
+    c.value = text
+    c.font  = Font(bold=True, color=text_color, size=13)
+    c.fill  = PatternFill("solid", fgColor=color)
+    c.alignment = Alignment(horizontal='center', vertical='center')
+
+def section_title(ws, row, col, text, color=DARK_BLUE):
+    c = ws.cell(row=row, column=col, value=text)
+    c.font = Font(bold=True, size=11, color=color)
+    c.fill = PatternFill("solid", fgColor="E8F0FE")
+    ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 9)
+
+
+# ─── Excel Generation ─────────────────────────────────────────────────────────
 
 @app.post("/excel")
 async def generate_excel(data: dict):
     wb = openpyxl.Workbook()
 
-    header_info  = data.get('header', {})
-    broker_info  = data.get('broker_info', {})
-    charges      = data.get('charges', {})
-    trades       = data.get('trades', [])
-    order_details= data.get('order_details', [])
+    header_info   = data.get('header', {})
+    broker_info   = data.get('broker_info', {})
+    charges       = data.get('charges', {})
+    equity_trades = data.get('trades', [])
+    derivatives   = data.get('derivatives', [])
+    order_details = data.get('order_details', [])
 
-    # ── Sheet 1: Trade Summary ──────────────────────────────────────────────
+    # ── Sheet 1: Full Trade Summary ──────────────────────────────────────────
     ws = wb.active
     ws.title = "Trade Summary"
     ws.sheet_view.showGridLines = False
 
-    def hdr_cell(cell, text):
-        cell.value = text
-        cell.font = Font(bold=True, color=WHITE, size=10)
-        cell.fill = PatternFill("solid", fgColor=MID_BLUE)
-        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        cell.border = make_border()
-
-    def title_merge(ws, cell_range, text):
-        ws.merge_cells(cell_range)
-        c = ws[cell_range.split(':')[0]]
-        c.value = text
-        c.font = Font(bold=True, color=DARK_BLUE, size=13)
-        c.fill = PatternFill("solid", fgColor=LIGHT_BLUE)
-        c.alignment = Alignment(horizontal='center', vertical='center')
-
-    # Title row
-    title_merge(ws, 'A1:N1', '📊  CONTRACT NOTE — TRADE SUMMARY  |  BrokerNote AI')
+    # Title
+    title_merge(ws, 'A1:N1', '📊  CONTRACT NOTE — FULL TRADE SUMMARY  |  BrokerNote AI')
     ws.row_dimensions[1].height = 32
 
     # Client info
     info_pairs = [
-        ("Client Name",      header_info.get('client_name', '—')),
-        ("Client Code (UCC)",header_info.get('client_code', '—')),
-        ("PAN Number",       header_info.get('pan', '—')),
-        ("Trade Date",       header_info.get('trade_date', '—')),
-        ("Contract Note No.",header_info.get('contract_note_no', '—')),
-        ("Settlement No.",   header_info.get('settlement_no', '—')),
-        ("Broker",           broker_info.get('broker', '—')),
-        ("Broker GST",       broker_info.get('broker_gst', '—')),
+        ("Client Name",       header_info.get('client_name', '—')),
+        ("Client Code (UCC)", header_info.get('client_code', '—')),
+        ("PAN Number",        header_info.get('pan', '—')),
+        ("Trade Date",        header_info.get('trade_date', '—')),
+        ("Contract Note No.", header_info.get('contract_note_no', '—')),
+        ("Settlement No.",    header_info.get('settlement_no', '—')),
+        ("Broker",            broker_info.get('broker', '—')),
+        ("Broker GST",        broker_info.get('broker_gst', '—')),
     ]
     for i, (label, value) in enumerate(info_pairs):
-        row = 3 + i
-        lc = ws.cell(row=row, column=1, value=label)
-        vc = ws.cell(row=row, column=2, value=value)
+        r = 3 + i
+        lc = ws.cell(row=r, column=1, value=label)
+        vc = ws.cell(row=r, column=2, value=value)
         lc.font = Font(bold=True, size=10, color=DARK_BLUE)
         vc.font = Font(size=10)
         lc.border = vc.border = make_border()
+    ws.column_dimensions['A'].width = 22
+    ws.column_dimensions['B'].width = 20
 
-    # Trade headers
-    trade_cols = [
-        ('A', 'ISIN', 14),
-        ('B', 'Security Name', 22),
-        ('C', 'Buy Qty', 10),
-        ('D', 'Buy WAP (₹)', 14),
-        ('E', 'Total Buy Value (₹)', 18),
-        ('F', 'Sell Qty', 10),
-        ('G', 'Sell WAP (₹)', 14),
-        ('H', 'Total Sell Value (₹)', 18),
-        ('I', 'Net Qty', 10),
-        ('J', 'Net Obligation (₹)', 18),
-    ]
-    HR = 13
-    for col_letter, col_name, width in trade_cols:
-        hdr_cell(ws[f'{col_letter}{HR}'], col_name)
-        ws.column_dimensions[col_letter].width = width
+    current_row = 13
 
-    for i, trade in enumerate(trades):
-        r = HR + 1 + i
-        fill = PatternFill("solid", fgColor=ALT_ROW) if i % 2 == 0 else None
-        vals = [
-            trade.get('isin', ''),
-            trade.get('security', ''),
-            trade.get('buy_qty', 0),
-            trade.get('buy_wap', 0),
-            trade.get('total_buy_value', 0),
-            trade.get('sell_qty', 0),
-            trade.get('sell_wap', 0),
-            trade.get('total_sell_value', 0),
-            trade.get('net_qty', 0),
-            trade.get('net_obligation', 0),
+    # ── Equity Section ───────────────────────────────────────────────────────
+    if equity_trades:
+        section_title(ws, current_row, 1, f"  📈  EQUITY SEGMENT — {len(equity_trades)} Securities")
+        current_row += 1
+
+        eq_cols = [
+            ('A', 'ISIN', 14), ('B', 'Security Name', 22),
+            ('C', 'Buy Qty', 10), ('D', 'Buy WAP (₹)', 14), ('E', 'Total Buy Value (₹)', 18),
+            ('F', 'Sell Qty', 10), ('G', 'Sell WAP (₹)', 14), ('H', 'Total Sell Value (₹)', 18),
+            ('I', 'Net Qty', 10), ('J', 'Net Obligation (₹)', 18),
         ]
-        for col_idx, val in enumerate(vals, 1):
-            c = ws.cell(row=r, column=col_idx, value=val)
-            c.border = make_border()
-            c.font = Font(size=10)
-            if fill:
-                c.fill = fill
-            if col_idx > 2 and isinstance(val, float):
-                c.number_format = '#,##0.00'
-            if col_idx in [3, 6, 9]:
-                c.number_format = '#,##0'
+        for col_letter, col_name, width in eq_cols:
+            hdr_cell(ws[f'{col_letter}{current_row}'], col_name, MID_BLUE)
+            ws.column_dimensions[col_letter].width = width
+        current_row += 1
 
-    # Charges section
-    cr = HR + len(trades) + 3
-    ws.cell(row=cr, column=1).value = "CHARGES & LEVIES"
-    ws.cell(row=cr, column=1).font = Font(bold=True, size=11, color=DARK_BLUE)
-    cr += 1
+        eq_buy_total = eq_sell_total = 0
+        for i, trade in enumerate(equity_trades):
+            fill = PatternFill("solid", fgColor=ALT_ROW) if i % 2 == 0 else None
+            vals = [
+                trade.get('isin', ''),        trade.get('security', ''),
+                trade.get('buy_qty', 0),       trade.get('buy_wap', 0),
+                trade.get('total_buy_value', 0),
+                trade.get('sell_qty', 0),      trade.get('sell_wap', 0),
+                trade.get('total_sell_value', 0),
+                trade.get('net_qty', 0),       trade.get('net_obligation', 0),
+            ]
+            eq_buy_total  += vals[4]
+            eq_sell_total += vals[7]
+            for col, val in enumerate(vals, 1):
+                c = ws.cell(row=current_row, column=col, value=val)
+                c.border = make_border()
+                c.font   = Font(size=10)
+                if fill: c.fill = fill
+                if col > 2 and isinstance(val, float):
+                    c.number_format = '#,##0.00'
+                if col in (3, 6, 9):
+                    c.number_format = '#,##0'
+            current_row += 1
+
+        # Equity subtotal
+        for col in range(1, 11):
+            c = ws.cell(row=current_row, column=col)
+            c.fill   = PatternFill("solid", fgColor="DBEAFE")
+            c.border = make_border()
+            c.font   = Font(bold=True, size=10)
+        ws.cell(row=current_row, column=1, value="EQUITY TOTAL").font = Font(bold=True, size=10, color=DARK_BLUE)
+        ws.cell(row=current_row, column=5, value=eq_buy_total).number_format  = '#,##0.00'
+        ws.cell(row=current_row, column=5).font = Font(bold=True, color=GREEN_MID)
+        ws.cell(row=current_row, column=8, value=eq_sell_total).number_format = '#,##0.00'
+        ws.cell(row=current_row, column=8).font = Font(bold=True, color=GREEN_MID)
+        current_row += 2
+
+    # ── Derivative Section ───────────────────────────────────────────────────
+    if derivatives:
+        section_title(ws, current_row, 1, f"  📊  DERIVATIVE SEGMENT — {len(derivatives)} Contracts")
+        current_row += 1
+
+        dv_cols = [
+            ('A', 'Contract Description', 36), ('B', 'Instrument', 12),
+            ('C', 'B/S', 8), ('D', 'Qty', 8),
+            ('E', 'WAP / Unit (₹)', 16), ('F', 'WAP After Brokerage (₹)', 22),
+            ('G', 'Closing Rate (₹)', 18), ('H', 'Net P&L (₹)', 16),
+        ]
+        for col_letter, col_name, width in dv_cols:
+            hdr_cell(ws[f'{col_letter}{current_row}'], col_name, PURPLE)
+            ws.column_dimensions[col_letter].width = width
+        current_row += 1
+
+        net_pnl = 0
+        for i, deriv in enumerate(derivatives):
+            fill = PatternFill("solid", fgColor="F5F3FF") if i % 2 == 0 else None
+            bs = deriv.get('buy_sell', '')
+            net = deriv.get('net_total', 0)
+            net_pnl += net
+            vals = [
+                deriv.get('contract', ''), deriv.get('instrument', ''),
+                bs, deriv.get('qty', 0),
+                deriv.get('wap', 0), deriv.get('wap_after_brokerage', 0),
+                deriv.get('closing_rate', 0), net,
+            ]
+            for col, val in enumerate(vals, 1):
+                c = ws.cell(row=current_row, column=col, value=val)
+                c.border = make_border()
+                c.font   = Font(size=10)
+                if fill: c.fill = fill
+                if col == 3:  # B/S color
+                    c.font = Font(size=10, bold=True,
+                                  color="16A34A" if 'BUY' in str(val).upper() else "DC2626")
+                if col >= 5 and isinstance(val, float):
+                    c.number_format = '#,##0.00'
+                if col == 4:
+                    c.number_format = '#,##0'
+                if col == 8 and isinstance(val, float):
+                    c.font = Font(bold=True, color="16A34A" if val >= 0 else "DC2626")
+            current_row += 1
+
+        # Derivative net P&L subtotal
+        for col in range(1, 9):
+            c = ws.cell(row=current_row, column=col)
+            c.fill   = PatternFill("solid", fgColor="EDE9FE")
+            c.border = make_border()
+            c.font   = Font(bold=True, size=10)
+        ws.cell(row=current_row, column=1, value="DERIVATIVE NET P&L").font = Font(bold=True, size=10, color=PURPLE)
+        npnl_cell = ws.cell(row=current_row, column=8, value=round(net_pnl, 2))
+        npnl_cell.number_format = '#,##0.00'
+        npnl_cell.font = Font(bold=True, color="16A34A" if net_pnl >= 0 else "DC2626")
+        current_row += 2
+
+    # ── Charges Section ──────────────────────────────────────────────────────
+    section_title(ws, current_row, 1, "  💰  CHARGES & EXPENSES — Category Wise Total (All Segments)")
+    current_row += 1
+
+    gst   = charges.get('gst', round(charges.get('cgst', 0) + charges.get('sgst', 0), 2))
+    stt   = charges.get('stt', 0)
+    exc   = charges.get('exchange_charges', 0)
+    sebi  = charges.get('sebi_fees', 0)
+    stamp = charges.get('stamp_duty', 0)
+    ipf   = charges.get('ipf_charges', 0)
+    brok_tv = charges.get('taxable_value', 0)   # brokerage taxable value
+    net   = charges.get('net_amount', 0)
+    pay_ob= charges.get('pay_obligation', 0)
 
     charge_rows = [
-        ("Pay / Receive Obligation",          charges.get('pay_obligation', 0)),
-        ("Securities Transaction Tax (STT)",  charges.get('stt', 0)),
-        ("Taxable Value of Supply",           charges.get('taxable_value', 0)),
-        ("CGST @ 9%",                         charges.get('cgst', 0)),
-        ("SGST @ 9%",                         charges.get('sgst', 0)),
-        ("Exchange Transaction Charges",      charges.get('exchange_charges', 0)),
-        ("SEBI Turnover Fees",                charges.get('sebi_fees', 0)),
-        ("Stamp Duty",                        charges.get('stamp_duty', 0)),
-        ("IPF Charges",                       charges.get('ipf_charges', 0)),
-        ("NET AMOUNT PAYABLE / RECEIVABLE",   charges.get('net_amount', 0)),
+        ("Gross Obligation (Pay / Receive)",           pay_ob,   False),
+        ("Securities Transaction Tax (STT)",           stt,      False),
+        ("Brokerage (Taxable Value of Supply)",        brok_tv,  False),
+        ("GST Expense  (CGST @ 9% + SGST @ 9%)",      gst,      False),
+        ("Exchange Transaction Charges",               exc,      False),
+        ("SEBI Turnover Fees",                         sebi,     False),
+        ("Stamp Duty",                                 stamp,    False),
+        ("IPF Charges",                                ipf,      False),
+        ("NET AMOUNT RECEIVABLE / (PAYABLE)",          net,      True),
     ]
 
-    for label, value in charge_rows:
-        is_total = label.startswith("NET AMOUNT")
-        lc = ws.cell(row=cr, column=1, value=label)
-        vc = ws.cell(row=cr, column=2, value=value)
+    ws.column_dimensions['A'].width = 42
+    ws.column_dimensions['B'].width = 20
+
+    for label, value, is_total in charge_rows:
+        if value == 0 and not is_total:
+            current_row += 1
+            continue
+        lc = ws.cell(row=current_row, column=1, value=label)
+        vc = ws.cell(row=current_row, column=2, value=abs(value) if is_total else value)
         lc.border = vc.border = make_border()
-        vc.number_format = '#,##0.00'
+        vc.number_format = '₹#,##0.00'
         if is_total:
             for c in [lc, vc]:
                 c.fill = PatternFill("solid", fgColor=DARK_BLUE)
                 c.font = Font(bold=True, color=WHITE, size=11)
+            # Add receivable/payable note
+            note_cell = ws.cell(row=current_row, column=3,
+                                value="← Receivable" if value >= 0 else "← Payable")
+            note_cell.font = Font(italic=True, color="16A34A" if value >= 0 else "DC2626", size=10)
         else:
-            lc.font = Font(size=10)
+            lc.font = Font(size=10, color=DARK_BLUE)
             vc.font = Font(size=10)
-        cr += 1
+        current_row += 1
 
-    ws.column_dimensions['A'].width = 36
-    ws.column_dimensions['B'].width = 18
-
-    # ── Sheet 2: Tally Journal Entry ────────────────────────────────────────
+    # ── Sheet 2: Tally Journal Entry ─────────────────────────────────────────
     ws2 = wb.create_sheet("Tally Journal Entry")
     ws2.sheet_view.showGridLines = False
     title_merge(ws2, 'A1:F1', '📒  TALLY JOURNAL ENTRY FORMAT  |  BrokerNote AI')
     ws2.row_dimensions[1].height = 32
 
-    jcols = [('A','Date',14), ('B','Voucher Type',16), ('C','Narration / Particulars',35),
-             ('D','Ledger Name',32), ('E','Debit (₹)',16), ('F','Credit (₹)',16)]
+    jcols = [
+        ('A', 'Date', 14), ('B', 'Voucher Type', 16),
+        ('C', 'Narration / Particulars', 38),
+        ('D', 'Ledger Name', 32), ('E', 'Debit (₹)', 16), ('F', 'Credit (₹)', 16),
+    ]
     for col_letter, col_name, width in jcols:
         hdr_cell(ws2[f'{col_letter}3'], col_name)
         ws2.column_dimensions[col_letter].width = width
 
     trade_date = header_info.get('trade_date', str(datetime.date.today()))
-
     journal_rows = []
-    for trade in trades:
-        total_buy = trade.get('total_buy_value', 0)
-        security  = trade.get('security', 'Investment')
-        if total_buy > 0:
-            journal_rows.append([trade_date, 'Journal', f"Purchase: {security} × {int(trade.get('buy_qty',0))} shares @ ₹{trade.get('buy_wap',0):.2f}", f"{security} A/c", total_buy, ''])
-            journal_rows.append([trade_date, 'Journal', '', 'Broker Payable A/c', '', total_buy])
 
-    charge_map = [
-        ("STT Expense A/c",          'stt'),
-        ("CGST Input Credit A/c",    'cgst'),
-        ("SGST Input Credit A/c",    'sgst'),
-        ("Exchange Charges Exp A/c", 'exchange_charges'),
-        ("SEBI Charges Exp A/c",     'sebi_fees'),
-        ("Stamp Duty Expense A/c",   'stamp_duty'),
-    ]
-    broker_credit = 0
-    for ledger, key in charge_map:
-        amt = charges.get(key, 0)
-        if amt and abs(amt) > 0:
-            broker_credit += abs(amt)
-            journal_rows.append([trade_date, 'Journal', f"{ledger.replace(' A/c','')}", ledger, abs(amt), ''])
+    # Equity journal entries
+    for trade in equity_trades:
+        sec = trade.get('security', 'Investment')
+        sell_val = trade.get('total_sell_value', 0)
+        buy_val  = trade.get('total_buy_value', 0)
+        if sell_val > 0:
+            journal_rows.append([trade_date, 'Journal',
+                f"Sale: {sec} × {int(trade.get('sell_qty',0))} shares @ ₹{trade.get('sell_wap',0):.2f}",
+                'Broker Receivable A/c', sell_val, ''])
+            journal_rows.append([trade_date, 'Journal', '', f"{sec} A/c (Investment)", '', sell_val])
+        if buy_val > 0:
+            journal_rows.append([trade_date, 'Journal',
+                f"Purchase: {sec} × {int(trade.get('buy_qty',0))} shares @ ₹{trade.get('buy_wap',0):.2f}",
+                f"{sec} A/c (Investment)", buy_val, ''])
+            journal_rows.append([trade_date, 'Journal', '', 'Broker Payable A/c', '', buy_val])
 
-    if broker_credit:
-        journal_rows.append([trade_date, 'Journal', 'Charges credited to broker account', 'Broker Payable A/c', '', broker_credit])
+    # Derivative journal entries
+    for deriv in derivatives:
+        net = deriv.get('net_total', 0)
+        bs  = deriv.get('buy_sell', '')
+        contract = deriv.get('contract', 'F&O Contract')
+        if net != 0:
+            if net > 0:
+                journal_rows.append([trade_date, 'Journal',
+                    f"{bs}: {contract} — P&L",
+                    'Broker Receivable A/c', abs(net), ''])
+                journal_rows.append([trade_date, 'Journal', '',
+                    'F&O Trading P&L A/c', '', abs(net)])
+            else:
+                journal_rows.append([trade_date, 'Journal',
+                    f"{bs}: {contract} — P&L",
+                    'F&O Trading P&L A/c', abs(net), ''])
+                journal_rows.append([trade_date, 'Journal', '',
+                    'Broker Payable A/c', '', abs(net)])
 
-    net_amt = abs(charges.get('net_amount', 0))
-    if net_amt:
-        journal_rows.append([trade_date, 'Payment', 'Payment to broker against contract note', 'Broker Payable A/c', net_amt, ''])
-        journal_rows.append([trade_date, 'Payment', '', 'Bank / Cash A/c', '', net_amt])
+    # Charges entries
+    if stt > 0:
+        journal_rows.append([trade_date, 'Journal', 'Securities Transaction Tax', 'STT Expense A/c', stt, ''])
+    if gst > 0:
+        journal_rows.append([trade_date, 'Journal', f'GST on Brokerage (CGST+SGST)', 'GST Expense A/c', gst, ''])
+    if exc > 0:
+        journal_rows.append([trade_date, 'Journal', 'Exchange Transaction Charges', 'Exchange Charges Exp A/c', exc, ''])
+    if sebi > 0:
+        journal_rows.append([trade_date, 'Journal', 'SEBI Turnover Fees', 'SEBI Charges Exp A/c', sebi, ''])
+    if stamp > 0:
+        journal_rows.append([trade_date, 'Journal', 'Stamp Duty', 'Stamp Duty Expense A/c', stamp, ''])
 
     for i, jr in enumerate(journal_rows):
         r = 4 + i
@@ -498,22 +683,21 @@ async def generate_excel(data: dict):
         for col, val in enumerate(jr, 1):
             c = ws2.cell(row=r, column=col, value=val)
             c.border = make_border()
-            c.font = Font(size=10)
-            if fill:
-                c.fill = fill
-            if col in [5, 6] and isinstance(val, (int, float)) and val:
+            c.font   = Font(size=10)
+            if fill: c.fill = fill
+            if col in (5, 6) and isinstance(val, (int, float)) and val:
                 c.number_format = '#,##0.00'
 
-    # ── Sheet 3: Order Details ───────────────────────────────────────────────
+    # ── Sheet 3: Order Details ────────────────────────────────────────────────
     if order_details:
         ws3 = wb.create_sheet("Order Details")
         ws3.sheet_view.showGridLines = False
         title_merge(ws3, 'A1:H1', '🗂  ORDER & TRADE DETAILS  |  BrokerNote AI')
         ws3.row_dimensions[1].height = 32
         od_cols = [
-            ('A','Order No',22), ('B','Order Time',14), ('C','Trade No',22),
-            ('D','Trade Time',14), ('E','Security',22), ('F','B/S',8),
-            ('G','Qty',10), ('H','Gross Rate (₹)',16)
+            ('A', 'Order No', 22), ('B', 'Order Time', 14), ('C', 'Trade No', 22),
+            ('D', 'Trade Time', 14), ('E', 'Security / Contract', 26),
+            ('F', 'B/S', 8), ('G', 'Qty', 10), ('H', 'Gross Rate (₹)', 18),
         ]
         for col_letter, col_name, width in od_cols:
             hdr_cell(ws3[f'{col_letter}3'], col_name)
@@ -527,20 +711,18 @@ async def generate_excel(data: dict):
             for col, val in enumerate(vals, 1):
                 c = ws3.cell(row=r, column=col, value=val)
                 c.border = make_border()
-                c.font = Font(size=10)
-                if fill:
-                    c.fill = fill
+                c.font   = Font(size=10)
+                if fill: c.fill = fill
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
 
     contract_no = header_info.get('contract_note_no', 'ContractNote').replace('/', '-')
-    filename = f"BrokerNote_{contract_no}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename=BrokerNote_{contract_no}.xlsx"}
     )
 
 
@@ -548,9 +730,10 @@ async def generate_excel(data: dict):
 
 @app.post("/tally-xml")
 async def generate_tally_xml(data: dict):
-    header  = data.get('header', {})
-    trades  = data.get('trades', [])
-    charges = data.get('charges', {})
+    header      = data.get('header', {})
+    equity      = data.get('trades', [])
+    derivatives = data.get('derivatives', [])
+    charges     = data.get('charges', {})
 
     trade_date = header.get('trade_date', '')
     try:
@@ -560,7 +743,7 @@ async def generate_tally_xml(data: dict):
         tally_date = datetime.datetime.now().strftime('%Y%m%d')
 
     narration = (
-        f"Contract Note No: {header.get('contract_note_no','')} | "
+        f"Contract Note: {header.get('contract_note_no','')} | "
         f"Client: {header.get('client_name','')} | PAN: {header.get('pan','')} | "
         f"Broker: {data.get('broker_info',{}).get('broker','')}"
     )
@@ -568,45 +751,36 @@ async def generate_tally_xml(data: dict):
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<ENVELOPE>',
-        '  <HEADER>',
-        '    <TALLYREQUEST>Import Data</TALLYREQUEST>',
-        '  </HEADER>',
-        '  <BODY>',
-        '    <IMPORTDATA>',
-        '      <REQUESTDESC>',
-        '        <REPORTNAME>Vouchers</REPORTNAME>',
-        '        <STATICVARIABLES>',
-        '          <SVCURRENTCOMPANY>##SVCURRENTCOMPANY##</SVCURRENTCOMPANY>',
-        '        </STATICVARIABLES>',
-        '      </REQUESTDESC>',
-        '      <REQUESTDATA>',
-        '        <TALLYMESSAGE xmlns:UDF="TallyUDF">',
-        '          <VOUCHER VCHTYPE="Journal" ACTION="Create" OBJVIEW="Accounting Voucher View">',
-        f'            <DATE>{tally_date}</DATE>',
-        f'            <NARRATION>{narration}</NARRATION>',
-        '            <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>',
+        '  <HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>',
+        '  <BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>',
+        '    <STATICVARIABLES><SVCURRENTCOMPANY>##SVCURRENTCOMPANY##</SVCURRENTCOMPANY></STATICVARIABLES>',
+        '  </REQUESTDESC><REQUESTDATA>',
+        '    <TALLYMESSAGE xmlns:UDF="TallyUDF">',
+        '      <VOUCHER VCHTYPE="Journal" ACTION="Create" OBJVIEW="Accounting Voucher View">',
+        f'        <DATE>{tally_date}</DATE>',
+        f'        <NARRATION>{narration}</NARRATION>',
+        '        <VOUCHERTYPENAME>Journal</VOUCHERTYPENAME>',
     ]
 
     total_dr = 0.0
 
-    # Debit: each stock purchased
-    for trade in trades:
+    for trade in equity:
         buy_val = trade.get('total_buy_value', 0)
         if buy_val > 0:
             total_dr += buy_val
             lines += [
-                '            <ALLLEDGERENTRIES.LIST>',
-                f'              <LEDGERNAME>{trade.get("security", "Investment")} A/c</LEDGERNAME>',
-                '              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
-                f'              <AMOUNT>-{buy_val:.2f}</AMOUNT>',
-                '            </ALLLEDGERENTRIES.LIST>',
+                '        <ALLLEDGERENTRIES.LIST>',
+                f'          <LEDGERNAME>{trade.get("security","Investment")} A/c</LEDGERNAME>',
+                '          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
+                f'          <AMOUNT>-{buy_val:.2f}</AMOUNT>',
+                '        </ALLLEDGERENTRIES.LIST>',
             ]
 
-    # Debit: charges
+    # GST combined
+    gst = charges.get('gst', round(charges.get('cgst', 0) + charges.get('sgst', 0), 2))
     charge_map = [
         ("STT Expense A/c",          'stt'),
-        ("CGST Input Credit A/c",    'cgst'),
-        ("SGST Input Credit A/c",    'sgst'),
+        ("GST Expense A/c",          'gst'),
         ("Exchange Charges Exp A/c", 'exchange_charges'),
         ("SEBI Charges Exp A/c",     'sebi_fees'),
         ("Stamp Duty Expense A/c",   'stamp_duty'),
@@ -616,29 +790,23 @@ async def generate_tally_xml(data: dict):
         if amt > 0:
             total_dr += amt
             lines += [
-                '            <ALLLEDGERENTRIES.LIST>',
-                f'              <LEDGERNAME>{ledger}</LEDGERNAME>',
-                '              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
-                f'              <AMOUNT>-{amt:.2f}</AMOUNT>',
-                '            </ALLLEDGERENTRIES.LIST>',
+                '        <ALLLEDGERENTRIES.LIST>',
+                f'          <LEDGERNAME>{ledger}</LEDGERNAME>',
+                '          <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>',
+                f'          <AMOUNT>-{amt:.2f}</AMOUNT>',
+                '        </ALLLEDGERENTRIES.LIST>',
             ]
 
-    # Credit: broker payable
     broker = data.get('broker_info', {}).get('broker', 'Broker')
     lines += [
-        '            <ALLLEDGERENTRIES.LIST>',
-        f'              <LEDGERNAME>{broker} Payable A/c</LEDGERNAME>',
-        '              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>',
-        f'              <AMOUNT>{total_dr:.2f}</AMOUNT>',
-        '            </ALLLEDGERENTRIES.LIST>',
-    ]
-
-    lines += [
-        '          </VOUCHER>',
-        '        </TALLYMESSAGE>',
-        '      </REQUESTDATA>',
-        '    </IMPORTDATA>',
-        '  </BODY>',
+        '        <ALLLEDGERENTRIES.LIST>',
+        f'          <LEDGERNAME>{broker} Payable A/c</LEDGERNAME>',
+        '          <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>',
+        f'          <AMOUNT>{total_dr:.2f}</AMOUNT>',
+        '        </ALLLEDGERENTRIES.LIST>',
+        '      </VOUCHER>',
+        '    </TALLYMESSAGE>',
+        '  </REQUESTDATA></IMPORTDATA></BODY>',
         '</ENVELOPE>',
     ]
 
