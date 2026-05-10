@@ -9,9 +9,26 @@ import hashlib
 import jwt
 import datetime
 import openpyxl
+import os
+import logging
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="BrokerNote AI", version="2.0.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(ca_run_daily_reminders, "cron", hour=9, minute=0)
+    scheduler.start()
+    log.info("Scheduler started — CA daily reminders at 09:00 IST")
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="BrokerNote AI", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1073,7 +1090,6 @@ async def generate_tally_xml(data: dict):
 # CA COMPLIANCE CALENDAR — Routes
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import os
 from fastapi import Header as FHeader
 
 CA_SENDER = os.getenv("CA_SENDER_NAME", "DigiAgentix CA Tools")
@@ -1110,11 +1126,13 @@ def ca_send_whatsapp(mobile: str, message: str) -> tuple:
         return False, "Twilio credentials not set in environment variables"
     try:
         from twilio.rest import Client as TwilioClient
-        to = f"whatsapp:{mobile}" if not mobile.startswith("whatsapp:") else mobile
+        # Auto-add whatsapp: prefix if user forgot it in env var
+        to  = mobile if mobile.startswith("whatsapp:") else f"whatsapp:{mobile}"
+        frm = frm if frm.startswith("whatsapp:") else f"whatsapp:{frm}"
         TwilioClient(sid, token).messages.create(from_=frm, to=to, body=message)
         return True, ""
     except Exception as e:
-        print(f"Twilio error: {e}")
+        log.error("Twilio error: %s", e)
         return False, str(e)
 
 
@@ -1279,3 +1297,49 @@ async def ca_get_logs(authorization: str = FHeader(None)):
     conn.close()
     return [{"client_name": r[0], "filing_type": r[1], "due_date": r[2],
              "mobile": r[3], "sent_at": r[4], "result": r[5]} for r in rows]
+
+
+# ─── Daily Reminder Engine (called by APScheduler at 09:00 every day) ─────────
+
+def ca_run_daily_reminders():
+    """Send WhatsApp reminders for clients with due dates 7 or 1 day(s) away."""
+    today = datetime.date.today()
+    alert_offsets = {7, 1}
+
+    conn = ca_get_db()
+    rows = conn.execute(
+        "SELECT id, user_id, name, mobile, filing_type, due_date "
+        "FROM ca_clients WHERE status='Pending'"
+    ).fetchall()
+
+    sent = 0
+    for row in rows:
+        cid, uid, name, mobile, filing, due_str = row
+        try:
+            due  = datetime.date.fromisoformat(due_str)
+            diff = (due - today).days
+            if diff not in alert_offsets:
+                continue
+        except Exception:
+            continue
+
+        msg = ca_build_msg(name, filing, due_str)
+        ok, err = ca_send_whatsapp(mobile, msg)
+        result = "sent-auto" if ok else "failed"
+        log.info("Auto-reminder %s → %s | %s | due %s%s",
+                 result.upper(), name, filing, due_str,
+                 f" | err: {err}" if err else "")
+
+        conn.execute(
+            "INSERT INTO ca_message_log "
+            "(user_id,client_name,filing_type,due_date,mobile,sent_at,result) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, name, filing, due_str, mobile,
+             datetime.datetime.now().isoformat(), result)
+        )
+        sent += 1
+
+    conn.commit()
+    conn.close()
+    log.info("Daily reminders done: %d sent", sent)
+    return sent
