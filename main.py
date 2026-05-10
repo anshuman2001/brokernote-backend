@@ -1101,18 +1101,21 @@ def ca_auth(authorization: str) -> int:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
-def ca_send_whatsapp(mobile: str, message: str) -> bool:
+def ca_send_whatsapp(mobile: str, message: str) -> tuple:
+    """Returns (success: bool, error: str)"""
+    sid   = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    frm   = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+    if not sid or not token:
+        return False, "Twilio credentials not set in environment variables"
     try:
-        if not TWILIO_SID or not TWILIO_TOKEN:
-            return False
         from twilio.rest import Client as TwilioClient
         to = f"whatsapp:{mobile}" if not mobile.startswith("whatsapp:") else mobile
-        TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
-            from_=TWILIO_FROM, to=to, body=message)
-        return True
+        TwilioClient(sid, token).messages.create(from_=frm, to=to, body=message)
+        return True, ""
     except Exception as e:
         print(f"Twilio error: {e}")
-        return False
+        return False, str(e)
 
 
 def ca_build_msg(name: str, filing: str, due: str) -> str:
@@ -1242,7 +1245,7 @@ async def ca_test_reminder(client_id: int, authorization: str = FHeader(None)):
     if not row: raise HTTPException(404, "Client not found")
     name, mobile, filing, due = row
     msg = ca_build_msg(name, filing, due)
-    ok  = ca_send_whatsapp(mobile, msg)
+    ok, err = ca_send_whatsapp(mobile, msg)
     result = "sent-manual" if ok else "failed"
     conn2 = ca_get_db()
     conn2.execute(
@@ -1250,7 +1253,7 @@ async def ca_test_reminder(client_id: int, authorization: str = FHeader(None)):
         (uid, name, filing, due, mobile, datetime.datetime.now().isoformat(), result)
     )
     conn2.commit(); conn2.close()
-    return {"success": ok, "message": msg, "to": mobile}
+    return {"success": ok, "message": msg, "to": mobile, "error": err}
 
 
 @app.get("/ca/logs")
