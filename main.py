@@ -29,14 +29,37 @@ ALGORITHM = "HS256"
 
 def init_db():
     conn = sqlite3.connect('/tmp/brokernote.db')
-    conn.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        name TEXT NOT NULL,
-        firm TEXT,
-        created_at TEXT NOT NULL
-    )''')
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            name TEXT NOT NULL,
+            firm TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ca_clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            pan TEXT,
+            mobile TEXT NOT NULL,
+            filing_type TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            status TEXT DEFAULT 'Pending',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ca_message_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            client_name TEXT,
+            filing_type TEXT,
+            due_date TEXT,
+            mobile TEXT,
+            sent_at TEXT,
+            result TEXT
+        );
+    ''')
     conn.commit()
     conn.close()
 
@@ -1044,3 +1067,200 @@ async def generate_tally_xml(data: dict):
         media_type="application/xml",
         headers={"Content-Disposition": f"attachment; filename=Tally_{contract_no}.xml"}
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CA COMPLIANCE CALENDAR — Routes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import os
+from fastapi import Header as FHeader
+
+CA_SENDER = os.getenv("CA_SENDER_NAME", "DigiAgentix CA Tools")
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM  = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+
+
+def ca_get_db():
+    return sqlite3.connect('/tmp/brokernote.db')
+
+
+def ca_auth(authorization: str) -> int:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    try:
+        token = authorization.split(" ", 1)[1]
+        email = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])["email"]
+        conn  = ca_get_db()
+        row   = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
+        if not row: raise Exception()
+        return row[0]
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+def ca_send_whatsapp(mobile: str, message: str) -> bool:
+    try:
+        if not TWILIO_SID or not TWILIO_TOKEN:
+            return False
+        from twilio.rest import Client as TwilioClient
+        to = f"whatsapp:{mobile}" if not mobile.startswith("whatsapp:") else mobile
+        TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            from_=TWILIO_FROM, to=to, body=message)
+        return True
+    except Exception as e:
+        print(f"Twilio error: {e}")
+        return False
+
+
+def ca_build_msg(name: str, filing: str, due: str) -> str:
+    try:
+        d = datetime.datetime.strptime(due, "%Y-%m-%d").strftime("%d %b %Y")
+    except Exception:
+        d = due
+    return (f"Dear {name},\n\nReminder: *{filing}* filing is due on *{d}*.\n"
+            f"Please share the required documents at the earliest.\n\n— {CA_SENDER}")
+
+
+def ca_row_to_dict(row) -> dict:
+    return {"id": row[0], "name": row[1], "pan": row[2] or "",
+            "mobile": row[3], "filing_type": row[4], "due_date": row[5], "status": row[6]}
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@app.post("/ca/auth/signup")
+async def ca_signup(body: dict):
+    email = body.get("email", "").lower().strip()
+    pw    = body.get("password", "")
+    name  = body.get("name", "").strip()
+    firm  = body.get("firm", "").strip()
+    if not email or not pw or not name:
+        raise HTTPException(400, "Email, password and name required")
+    if len(pw) < 6:
+        raise HTTPException(400, "Password min 6 characters")
+    conn = ca_get_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (email,password,name,firm,created_at) VALUES (?,?,?,?,?)",
+            (email, hash_password(pw), name, firm, datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+        return {"token": create_token(email), "email": email, "name": name, "firm": firm}
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "Email already registered")
+    finally:
+        conn.close()
+
+
+@app.post("/ca/auth/login")
+async def ca_login(body: dict):
+    email = body.get("email", "").lower().strip()
+    pw    = body.get("password", "")
+    conn  = ca_get_db()
+    row   = conn.execute(
+        "SELECT email,name,firm FROM users WHERE email=? AND password=?",
+        (email, hash_password(pw))
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(401, "Invalid email or password")
+    return {"token": create_token(row[0]), "email": row[0], "name": row[1], "firm": row[2]}
+
+
+# ── Clients CRUD ──────────────────────────────────────────────────────────────
+
+@app.get("/ca/clients")
+async def ca_get_clients(authorization: str = FHeader(None)):
+    uid  = ca_auth(authorization)
+    conn = ca_get_db()
+    rows = conn.execute(
+        "SELECT id,name,pan,mobile,filing_type,due_date,status FROM ca_clients WHERE user_id=? ORDER BY due_date ASC",
+        (uid,)
+    ).fetchall()
+    conn.close()
+    return [ca_row_to_dict(r) for r in rows]
+
+
+@app.post("/ca/clients")
+async def ca_add_client(body: dict, authorization: str = FHeader(None)):
+    uid  = ca_auth(authorization)
+    name, mobile = body.get("name","").strip(), body.get("mobile","").strip()
+    filing, due  = body.get("filing_type","").strip(), body.get("due_date","").strip()
+    pan, status  = body.get("pan","").strip(), body.get("status","Pending")
+    if not name or not mobile or not filing or not due:
+        raise HTTPException(400, "name, mobile, filing_type, due_date required")
+    conn = ca_get_db()
+    cur  = conn.execute(
+        "INSERT INTO ca_clients (user_id,name,pan,mobile,filing_type,due_date,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (uid, name, pan, mobile, filing, due, status, datetime.datetime.now().isoformat())
+    )
+    conn.commit()
+    row = conn.execute("SELECT id,name,pan,mobile,filing_type,due_date,status FROM ca_clients WHERE id=?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return ca_row_to_dict(row)
+
+
+@app.put("/ca/clients/{client_id}")
+async def ca_update_client(client_id: int, body: dict, authorization: str = FHeader(None)):
+    uid  = ca_auth(authorization)
+    conn = ca_get_db()
+    if not conn.execute("SELECT id FROM ca_clients WHERE id=? AND user_id=?", (client_id, uid)).fetchone():
+        conn.close(); raise HTTPException(404, "Not found")
+    fields = {k: v for k, v in body.items() if k in ("name","pan","mobile","filing_type","due_date","status")}
+    if fields:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE ca_clients SET {sets} WHERE id=?", (*fields.values(), client_id))
+        conn.commit()
+    row = conn.execute("SELECT id,name,pan,mobile,filing_type,due_date,status FROM ca_clients WHERE id=?", (client_id,)).fetchone()
+    conn.close()
+    return ca_row_to_dict(row)
+
+
+@app.delete("/ca/clients/{client_id}")
+async def ca_delete_client(client_id: int, authorization: str = FHeader(None)):
+    uid = ca_auth(authorization)
+    conn = ca_get_db()
+    conn.execute("DELETE FROM ca_clients WHERE id=? AND user_id=?", (client_id, uid))
+    conn.commit(); conn.close()
+    return {"deleted": True}
+
+
+# ── Reminders ─────────────────────────────────────────────────────────────────
+
+@app.post("/ca/remind/test/{client_id}")
+async def ca_test_reminder(client_id: int, authorization: str = FHeader(None)):
+    uid  = ca_auth(authorization)
+    conn = ca_get_db()
+    row  = conn.execute(
+        "SELECT name,mobile,filing_type,due_date FROM ca_clients WHERE id=? AND user_id=?",
+        (client_id, uid)
+    ).fetchone()
+    conn.close()
+    if not row: raise HTTPException(404, "Client not found")
+    name, mobile, filing, due = row
+    msg = ca_build_msg(name, filing, due)
+    ok  = ca_send_whatsapp(mobile, msg)
+    result = "sent-manual" if ok else "failed"
+    conn2 = ca_get_db()
+    conn2.execute(
+        "INSERT INTO ca_message_log (user_id,client_name,filing_type,due_date,mobile,sent_at,result) VALUES (?,?,?,?,?,?,?)",
+        (uid, name, filing, due, mobile, datetime.datetime.now().isoformat(), result)
+    )
+    conn2.commit(); conn2.close()
+    return {"success": ok, "message": msg, "to": mobile}
+
+
+@app.get("/ca/logs")
+async def ca_get_logs(authorization: str = FHeader(None)):
+    uid  = ca_auth(authorization)
+    conn = ca_get_db()
+    rows = conn.execute(
+        "SELECT client_name,filing_type,due_date,mobile,sent_at,result FROM ca_message_log WHERE user_id=? ORDER BY sent_at DESC LIMIT 100",
+        (uid,)
+    ).fetchall()
+    conn.close()
+    return [{"client_name": r[0], "filing_type": r[1], "due_date": r[2],
+             "mobile": r[3], "sent_at": r[4], "result": r[5]} for r in rows]
