@@ -1256,6 +1256,18 @@ async def ca_test_reminder(client_id: int, authorization: str = FHeader(None)):
     return {"success": ok, "message": msg, "to": mobile, "error": err}
 
 
+@app.get("/ca/debug")
+async def ca_debug():
+    sid   = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    frm   = os.getenv("TWILIO_WHATSAPP_FROM", "")
+    return {
+        "TWILIO_ACCOUNT_SID":    f"{sid[:6]}..." if sid else "NOT SET",
+        "TWILIO_AUTH_TOKEN":     "SET" if token else "NOT SET",
+        "TWILIO_WHATSAPP_FROM":  frm if frm else "NOT SET",
+    }
+
+
 @app.get("/ca/logs")
 async def ca_get_logs(authorization: str = FHeader(None)):
     uid  = ca_auth(authorization)
