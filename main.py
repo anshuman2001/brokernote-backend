@@ -1393,6 +1393,8 @@ async def cert_issue(body: dict, authorization: str = FHeader(None)):
     if not name or not role or not dur:
         raise HTTPException(400, "student_name, internship_role, duration required")
     cert_id = gen_cert_id()
+    # Allow custom issued_date from admin; default to today
+    issued_date = body.get("issued_date", "").strip() or datetime.date.today().isoformat()
     conn = ca_get_db()
     conn.execute(
         "INSERT INTO certificates (id,student_name,email,phone,internship_role,department,"
@@ -1400,7 +1402,7 @@ async def cert_issue(body: dict, authorization: str = FHeader(None)):
         (cert_id, name, body.get("email",""), body.get("phone",""),
          role, body.get("department",""), dur,
          body.get("start_date",""), body.get("end_date",""),
-         datetime.date.today().isoformat(), "Active")
+         issued_date, "Active")
     )
     conn.commit()
     conn.close()
