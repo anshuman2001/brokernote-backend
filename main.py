@@ -93,6 +93,20 @@ def init_db():
         );
     ''')
     conn.commit()
+
+    # Auto-recreate admin account from env vars after every DB wipe (Render restart)
+    admin_email = os.getenv("ADMIN_EMAIL", "").lower().strip()
+    admin_pw    = os.getenv("ADMIN_PASSWORD", "")
+    admin_name  = os.getenv("ADMIN_NAME", "Admin")
+    if admin_email and admin_pw:
+        pw_hash = hashlib.sha256(admin_pw.encode()).hexdigest()
+        conn.execute(
+            "INSERT OR IGNORE INTO users (email,password,name,firm,created_at) VALUES (?,?,?,?,?)",
+            (admin_email, pw_hash, admin_name, "DigiAgentix", datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+        log.info("Admin account ensured: %s", admin_email)
+
     conn.close()
 
 init_db()
