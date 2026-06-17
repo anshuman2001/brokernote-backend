@@ -11,6 +11,8 @@ import datetime
 import openpyxl
 import os
 import logging
+import random
+import string
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
@@ -75,6 +77,19 @@ def init_db():
             mobile TEXT,
             sent_at TEXT,
             result TEXT
+        );
+        CREATE TABLE IF NOT EXISTS certificates (
+            id TEXT PRIMARY KEY,
+            student_name TEXT NOT NULL,
+            email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            internship_role TEXT NOT NULL,
+            department TEXT DEFAULT '',
+            duration TEXT NOT NULL,
+            start_date TEXT DEFAULT '',
+            end_date TEXT DEFAULT '',
+            issued_date TEXT NOT NULL,
+            status TEXT DEFAULT 'Active'
         );
     ''')
     conn.commit()
@@ -1343,3 +1358,98 @@ def ca_run_daily_reminders():
     conn.close()
     log.info("Daily reminders done: %d sent", sent)
     return sent
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTERNSHIP CERTIFICATE VERIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def gen_cert_id() -> str:
+    """Generate unique certificate ID like DAGI-X7K2M9Q4"""
+    chars = string.ascii_uppercase + string.digits
+    return "DAGI-" + ''.join(random.choices(chars, k=8))
+
+
+@app.post("/certs/issue")
+async def cert_issue(body: dict, authorization: str = FHeader(None)):
+    ca_auth(authorization)
+    name = body.get("student_name", "").strip()
+    role = body.get("internship_role", "").strip()
+    dur  = body.get("duration", "").strip()
+    if not name or not role or not dur:
+        raise HTTPException(400, "student_name, internship_role, duration required")
+    cert_id = gen_cert_id()
+    conn = ca_get_db()
+    conn.execute(
+        "INSERT INTO certificates (id,student_name,email,phone,internship_role,department,"
+        "duration,start_date,end_date,issued_date,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (cert_id, name, body.get("email",""), body.get("phone",""),
+         role, body.get("department",""), dur,
+         body.get("start_date",""), body.get("end_date",""),
+         datetime.date.today().isoformat(), "Active")
+    )
+    conn.commit()
+    conn.close()
+    log.info("Certificate issued: %s → %s (%s)", cert_id, name, role)
+    return {"cert_id": cert_id, "student_name": name, "internship_role": role,
+            "duration": dur, "issued_date": datetime.date.today().isoformat(), "status": "Active"}
+
+
+@app.get("/certs")
+async def cert_list(authorization: str = FHeader(None)):
+    ca_auth(authorization)
+    conn = ca_get_db()
+    rows = conn.execute(
+        "SELECT id,student_name,email,internship_role,department,duration,issued_date,status "
+        "FROM certificates ORDER BY issued_date DESC"
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "student_name": r[1], "email": r[2], "internship_role": r[3],
+             "department": r[4], "duration": r[5], "issued_date": r[6], "status": r[7]}
+            for r in rows]
+
+
+@app.get("/certs/verify/{cert_id}")
+async def cert_verify(cert_id: str):
+    conn = ca_get_db()
+    row = conn.execute(
+        "SELECT id,student_name,email,phone,internship_role,department,"
+        "duration,start_date,end_date,issued_date,status FROM certificates WHERE id=?",
+        (cert_id.upper(),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, "Certificate not found")
+    return {
+        "id": row[0], "student_name": row[1], "email": row[2], "phone": row[3],
+        "internship_role": row[4], "department": row[5], "duration": row[6],
+        "start_date": row[7], "end_date": row[8], "issued_date": row[9],
+        "status": row[10], "verified": row[10] == "Active",
+        "issued_by": "DigiAgentix"
+    }
+
+
+@app.put("/certs/{cert_id}/revoke")
+async def cert_revoke(cert_id: str, authorization: str = FHeader(None)):
+    ca_auth(authorization)
+    conn = ca_get_db()
+    conn.execute("UPDATE certificates SET status='Revoked' WHERE id=?", (cert_id.upper(),))
+    conn.commit()
+    conn.close()
+    return {"revoked": True, "id": cert_id.upper()}
+
+
+@app.get("/certs/qr/{cert_id}")
+async def cert_qr_code(cert_id: str):
+    """Generate and return a QR code PNG for the certificate verification URL."""
+    import qrcode
+    verify_url = f"https://digiagentix.com/verify?id={cert_id.upper()}"
+    img = qrcode.make(verify_url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="image/png",
+        headers={"Content-Disposition": f"inline; filename=QR_{cert_id.upper()}.png",
+                 "Cache-Control": "public, max-age=86400"}
+    )
